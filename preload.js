@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('api', {
   setZoom: f => webFrame.setZoomFactor(f),
   selectSyncFolder: data => ipcRenderer.invoke('sync:selectFolder', data),
   disableSync: () => ipcRenderer.invoke('sync:disable'),
+  forceSync: () => ipcRenderer.invoke('sync:force'),
   exportData: data => ipcRenderer.invoke('data:export', data),
   importData: () => ipcRenderer.invoke('data:import'),
   hide: () => ipcRenderer.send('win:hide'),

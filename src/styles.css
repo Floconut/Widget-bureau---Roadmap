@@ -577,6 +577,7 @@ input, select { font: inherit; color: inherit; }
   background: var(--pop);
 }
 .dlg-head h3 { margin: 0; }
+.dialog.settings .dlg-head [data-close] { width: 44px; height: 44px; flex: none; }
 .btn {
   display: inline-flex;
   align-items: center;

@@ -13,6 +13,7 @@ const bridge = window.api || {
   setZoom(f) { document.body.style.zoom = f; },
   async selectSyncFolder() { return null; },
   async disableSync() { return false; },
+  async forceSync() { return false; },
   async exportData(d) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }));
@@ -57,6 +58,7 @@ const ICONS = {
   copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/>',
   fold: '<path d="m7 20 5-5 5 5M7 4l5 5 5-5"/>',
   reset: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
+  sync: '<path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M5.6 9a7 7 0 0 1 11.8-2.5L20 12M4 12l2.6 5.5A7 7 0 0 0 18.4 15"/>',
   download: '<path d="M12 3v12m-5-5 5 5 5-5M5 21h14"/>',
   upload: '<path d="M12 17V5m-5 5 5-5 5 5M5 21h14"/>',
   power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
@@ -869,6 +871,7 @@ function settingsHTML() {
     <div class="sec">Synchronisation entre PC</div>
     <p class="sync-info">${esc(syncFolder ? `${syncStatusMessage}\n${syncFolder}` : syncStatusMessage)}</p>
     <div class="btn-row">
+      ${syncFolder ? `<button class="btn" data-do="sync-now">${ico('sync')} Synchroniser maintenant</button>` : ''}
       <button class="btn" data-do="sync-select">${syncFolder ? 'Changer de dossier' : 'Choisir un dossier partagé'}</button>
       ${syncFolder ? '<button class="btn" data-do="sync-disable">Désactiver</button>' : ''}
     </div>
@@ -916,6 +919,15 @@ async function disableSync() {
   }
 }
 
+async function forceSync() {
+  try {
+    await bridge.forceSync();
+  } catch (err) {
+    syncStatusMessage = `Erreur de synchronisation : ${err.message}`;
+    toast(syncStatusMessage);
+  }
+}
+
 function openSettings() {
   if (editing) commitEdit('blur');
   const m = modal('', 'settings');
@@ -937,6 +949,7 @@ function openSettings() {
     const d = e.target.closest('[data-do]')?.dataset.do;
     if (d === 'export') exportData();
     else if (d === 'import') { m.close(); importData(); }
+    else if (d === 'sync-now') forceSync().then(paint);
     else if (d === 'sync-select') selectSyncFolder().then(paint);
     else if (d === 'sync-disable') disableSync().then(paint);
     else if (d === 'quit') { flushSave(true); bridge.quit(); }

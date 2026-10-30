@@ -85,12 +85,22 @@ function saveSharedData(data) {
     reportSyncError(err);
   }
 }
-function checkSharedFile() {
+function checkSharedFile(manual = false) {
   const file = syncDataFile();
-  if (!file || !fs.existsSync(file)) return;
+  if (!file) {
+    if (manual) updateSyncStatus('Synchronisation non configurée');
+    return;
+  }
+  if (!fs.existsSync(file)) {
+    if (manual) updateSyncStatus('Dossier partagé indisponible ou fichier en attente');
+    return;
+  }
   try {
     const content = fs.readFileSync(file, 'utf8');
-    if (content === lastSyncContent) return;
+    if (content === lastSyncContent) {
+      if (manual) updateSyncStatus('Synchronisé');
+      return;
+    }
     const data = withLocalSettings(parseSyncData(content));
     writeJSON(dataFile(), data);
     lastSyncContent = content;
@@ -343,6 +353,10 @@ ipcMain.handle('sync:disable', () => {
   lastSyncContent = null;
   lastSyncError = null;
   updateSyncStatus('Synchronisation désactivée');
+  return true;
+});
+ipcMain.handle('sync:force', () => {
+  checkSharedFile(true);
   return true;
 });
 
