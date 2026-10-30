@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, dialog, screen, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, dialog, screen, shell, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -25,10 +25,12 @@ let quitting = false;
 let settings = {};
 let syncFolder = null;
 let syncPoller = null;
-let lastSyncContent = null;
+let syncBase = null;          // dernier état commun aux deux PC (sert à fusionner)
+let syncHealthy = false;
 let lastSyncError = null;
 let syncStatusMessage = 'Synchronisation non configurée';
 const LOCAL_SETTINGS = ['alwaysOnTop', 'showInTaskbar', 'autostart'];
+const syncBaseFile = () => path.join(app.getPath('userData'), 'sync-base.json');
 
 function readJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
@@ -50,18 +52,28 @@ function parseSyncData(content) {
   if (!isSyncData(data)) throw new Error('Le fichier partagé ne contient pas de roadmap valide.');
   return data;
 }
+// Réglages et projet affiché restent propres à chaque PC
 function withLocalSettings(data) {
-  const localSettings = readJSON(dataFile())?.settings || {};
+  const local = readJSON(dataFile()) || {};
+  const localSettings = local.settings || {};
   const settings = { ...(data.settings || {}) };
   LOCAL_SETTINGS.forEach(key => {
     if (typeof localSettings[key] === 'boolean') settings[key] = localSettings[key];
   });
-  return { ...data, settings };
+  const merged = { ...data, settings };
+  if (local.currentProjectId) merged.currentProjectId = local.currentProjectId;
+  return merged;
 }
 function sharedData(data) {
   const copy = JSON.parse(JSON.stringify(data));
   LOCAL_SETTINGS.forEach(key => { delete copy.settings?.[key]; });
+  delete copy.currentProjectId;
   return copy;
+}
+function setSyncBase(data) {
+  syncBase = data;
+  if (data) writeJSON(syncBaseFile(), data);
+  else try { fs.unlinkSync(syncBaseFile()); } catch {}
 }
 function updateSyncStatus(message) {
   syncStatusMessage = message;
@@ -71,69 +83,101 @@ function reportSyncError(err) {
   const message = `Erreur de synchronisation : ${err.message}`;
   if (message !== lastSyncError) console.error(message);
   lastSyncError = message;
+  syncHealthy = false;
   updateSyncStatus(message);
 }
-function saveSharedData(data) {
-  const file = syncDataFile();
-  if (!file) return;
-  try {
-    writeJSON(file, sharedData(data));
-    lastSyncContent = fs.readFileSync(file, 'utf8');
-    lastSyncError = null;
-    updateSyncStatus('Synchronisé');
-  } catch (err) {
-    reportSyncError(err);
+
+/* ---------- Fusion à trois voies (base commune, ce PC, l'autre PC) ---------- */
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const isObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+const isIdList = v => Array.isArray(v) && v.every(x => isObject(x) && 'id' in x);
+
+function mergeValue(base, local, remote) {
+  if (same(local, remote)) return local;
+  if (same(base, local)) return remote;
+  if (same(base, remote)) return local;
+  if (isIdList(local) && isIdList(remote)) return mergeList(isIdList(base) ? base : [], local, remote);
+  if (isObject(local) && isObject(remote)) {
+    const b = isObject(base) ? base : {};
+    const out = {};
+    new Set([...Object.keys(local), ...Object.keys(remote)]).forEach(k => {
+      const v = mergeValue(b[k], local[k], remote[k]);
+      if (v !== undefined) out[k] = v;
+    });
+    return out;
   }
+  return local; // modifié des deux côtés : la version de ce PC l'emporte
 }
-function checkSharedFile(manual = false) {
+function mergeList(base, local, remote) {
+  const byId = list => new Map(list.map(x => [x.id, x]));
+  const ids = list => list.map(x => x.id);
+  const b = byId(base), l = byId(local), r = byId(remote);
+  // On garde l'ordre du côté qui a réordonné, puis on insère les éléments ajoutés de l'autre côté
+  const [main, other] = same(ids(local), ids(base)) ? [remote, local] : [local, remote];
+  const order = ids(main);
+  ids(other).forEach((id, i, arr) => {
+    if (order.includes(id)) return;
+    const prev = arr.slice(0, i).reverse().find(p => order.includes(p));
+    order.splice(prev === undefined ? 0 : order.indexOf(prev) + 1, 0, id);
+  });
+  return order.map(id => {
+    if (l.has(id) && r.has(id)) return mergeValue(b.get(id), l.get(id), r.get(id));
+    const only = l.has(id) ? l.get(id) : r.get(id);
+    // Supprimé d'un côté et pas modifié de l'autre : la suppression l'emporte
+    return b.has(id) && same(b.get(id), only) ? undefined : only;
+  }).filter(x => x !== undefined);
+}
+
+/* ---------- Synchronisation : envoie, reçoit ou fusionne, et réessaie tant que le Drive est absent ---------- */
+function syncNow({ manual = false, startup = false } = {}) {
   const file = syncDataFile();
   if (!file) {
     if (manual) updateSyncStatus('Synchronisation non configurée');
     return;
   }
-  if (!fs.existsSync(file)) {
-    if (manual) updateSyncStatus('Dossier partagé indisponible ou fichier en attente');
+  if (!fs.existsSync(syncFolder)) {
+    syncHealthy = false;
+    if (syncStatusMessage !== 'Dossier partagé indisponible, nouvel essai automatique…' || manual) {
+      updateSyncStatus('Dossier partagé indisponible, nouvel essai automatique…');
+    }
     return;
   }
   try {
-    const content = fs.readFileSync(file, 'utf8');
-    if (content === lastSyncContent) {
-      if (manual) updateSyncStatus('Synchronisé');
-      return;
+    const localData = readJSON(dataFile());
+    const local = isSyncData(localData) ? sharedData(localData) : null;
+    const remote = fs.existsSync(file) ? parseSyncData(fs.readFileSync(file, 'utf8')) : null;
+    if (!local && !remote) return;
+    const merged = !remote ? local : !local ? remote : mergeValue(syncBase, local, remote);
+    const sent = !same(merged, remote);
+    const received = !same(merged, local);
+
+    if (sent) writeJSON(file, merged);
+    if (received) {
+      const data = withLocalSettings(merged);
+      writeJSON(dataFile(), data);
+      if (!startup && win && !win.isDestroyed()) win.webContents.send('data:remoteUpdate', data);
     }
-    const data = withLocalSettings(parseSyncData(content));
-    writeJSON(dataFile(), data);
-    lastSyncContent = content;
+    if (!same(merged, syncBase)) setSyncBase(merged);
+
     lastSyncError = null;
-    updateSyncStatus('Mise à jour reçue');
-    if (win && !win.isDestroyed()) win.webContents.send('data:remoteUpdate', data);
+    if (sent || received || manual || !syncHealthy) {
+      updateSyncStatus(sent && received ? 'Modifications des deux PC fusionnées' : received ? 'Mise à jour reçue' : 'Synchronisé');
+    }
+    syncHealthy = true;
   } catch (err) {
     reportSyncError(err);
   }
 }
 function startSyncPolling() {
   clearInterval(syncPoller);
-  syncPoller = setInterval(checkSharedFile, 2000);
+  syncPoller = setInterval(() => syncNow(), 2000);
 }
 function loadSyncConfiguration() {
-  if (!fs.existsSync(syncConfigFile())) return;
-  try {
-    const config = JSON.parse(fs.readFileSync(syncConfigFile(), 'utf8'));
-    if (typeof config.folder !== 'string' || !config.folder) return;
-    syncFolder = config.folder;
-    const file = syncDataFile();
-    if (fs.existsSync(file)) {
-      const content = fs.readFileSync(file, 'utf8');
-      const data = withLocalSettings(parseSyncData(content));
-      writeJSON(dataFile(), data);
-      lastSyncContent = content;
-      syncStatusMessage = 'Synchronisé';
-    } else {
-      syncStatusMessage = 'Dossier partagé indisponible ou fichier en attente';
-    }
-  } catch (err) {
-    reportSyncError(err);
-  }
+  const config = readJSON(syncConfigFile());
+  if (!config || typeof config.folder !== 'string' || !config.folder) return;
+  syncFolder = config.folder;
+  syncBase = readJSON(syncBaseFile());
+  syncNow({ startup: true });
 }
 
 /* ---------- Démarrage avec Windows (raccourci dans le dossier Démarrage) ---------- */
@@ -302,13 +346,13 @@ ipcMain.handle('data:load', () => ({
 }));
 ipcMain.handle('data:save', (e, data) => {
   writeJSON(dataFile(), data);
-  saveSharedData(data);
+  syncNow();
   return true;
 });
 ipcMain.on('data:saveSync', (e, data) => {
   try {
     writeJSON(dataFile(), data);
-    saveSharedData(data);
+    syncNow();
   } catch (err) { console.error(err); }
   e.returnValue = true;
 });
@@ -326,21 +370,22 @@ ipcMain.handle('sync:selectFolder', async (e, data) => {
   const folder = path.resolve(result.filePaths[0]);
   const file = path.join(folder, 'roadmap-widget-sync.json');
   let remoteData = null;
-  let content = null;
+  let shared = null;
   if (fs.existsSync(file)) {
-    content = fs.readFileSync(file, 'utf8');
-    remoteData = withLocalSettings(parseSyncData(content));
+    shared = parseSyncData(fs.readFileSync(file, 'utf8'));
+    remoteData = withLocalSettings(shared);
     writeJSON(dataFile(), remoteData);
   } else {
     if (!isSyncData(data)) throw new Error('Aucune roadmap à enregistrer dans le dossier partagé.');
-    writeJSON(file, data);
-    content = fs.readFileSync(file, 'utf8');
+    shared = sharedData(data);
+    writeJSON(file, shared);
   }
 
   writeJSON(syncConfigFile(), { folder });
   syncFolder = folder;
-  lastSyncContent = content;
+  setSyncBase(shared);
   lastSyncError = null;
+  syncHealthy = true;
   updateSyncStatus('Synchronisé');
   startSyncPolling();
   return { folder, data: remoteData, message: syncStatusMessage };
@@ -350,13 +395,14 @@ ipcMain.handle('sync:disable', () => {
   clearInterval(syncPoller);
   syncPoller = null;
   syncFolder = null;
-  lastSyncContent = null;
+  setSyncBase(null);
   lastSyncError = null;
+  syncHealthy = false;
   updateSyncStatus('Synchronisation désactivée');
   return true;
 });
 ipcMain.handle('sync:force', () => {
-  checkSharedFile(true);
+  syncNow({ manual: true });
   return true;
 });
 
@@ -396,6 +442,8 @@ if (!CAPTURE && !app.requestSingleInstanceLock()) {
     createWindow();
     if (!CAPTURE) createTray();
     if (syncFolder) startSyncPolling();
+    // Au réveil du PC, on rattrape tout de suite ce que l'autre PC a pu changer
+    powerMonitor.on('resume', () => syncNow());
   });
   // Avant de quitter, on demande à l'interface d'enregistrer ses dernières modifications
   let flushed = false;
