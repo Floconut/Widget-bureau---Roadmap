@@ -1,0 +1,14 @@
+{
+  "name": "roadmap-widget",
+  "productName": "Roadmap Widget",
+  "version": "1.0.0",
+  "description": "Widget de bureau Windows pour suivre ses roadmaps par projet",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^44.9.0"
+  }
+}

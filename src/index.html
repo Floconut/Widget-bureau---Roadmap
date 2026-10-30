@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<title>Roadmap</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header id="titlebar">
+  <button id="projBtn" title="Mes projets">
+    <span id="pIcon" class="p-icon">🗺️</span>
+    <span id="pName" class="p-name">Roadmap</span>
+    <span class="chev" data-icon="chevron"></span>
+  </button>
+  <div id="overall" class="overall"><span class="ring"></span><span id="overallTxt">0%</span></div>
+  <div class="grow"></div>
+  <div class="tb">
+    <button id="btnUndo" class="ib" title="Annuler (Ctrl+Z)" data-icon="undo"></button>
+    <button id="btnPin" class="ib" title="Toujours au premier plan" data-icon="pin"></button>
+    <button id="btnSettings" class="ib" title="Personnaliser" data-icon="sliders"></button>
+    <button id="btnHide" class="ib" title="Masquer (le widget reste dans la zone de notification)" data-icon="minus"></button>
+  </div>
+</header>
+<main id="board" class="board"></main>
+<div id="layer"></div>
+<script src="app.js"></script>
+</body>
+</html>
