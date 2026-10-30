@@ -15,6 +15,7 @@ const SIZE = arg('size');
 const ASSETS = path.join(__dirname, 'assets');
 const dataFile = () => path.join(app.getPath('userData'), 'roadmaps.json');
 const winFile = () => path.join(app.getPath('userData'), 'window.json');
+const syncConfigFile = () => path.join(app.getPath('userData'), 'sync.json');
 const startupLink = () =>
   path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Roadmap Widget.lnk');
 
@@ -22,6 +23,12 @@ let win = null;
 let tray = null;
 let quitting = false;
 let settings = {};
+let syncFolder = null;
+let syncPoller = null;
+let lastSyncContent = null;
+let lastSyncError = null;
+let syncStatusMessage = 'Synchronisation non configurée';
+const LOCAL_SETTINGS = ['alwaysOnTop', 'showInTaskbar', 'autostart'];
 
 function readJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
@@ -30,6 +37,93 @@ function writeJSON(file, data) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   fs.renameSync(tmp, file);
+}
+
+function syncDataFile() {
+  return syncFolder && path.join(syncFolder, 'roadmap-widget-sync.json');
+}
+function isSyncData(data) {
+  return data && Array.isArray(data.projects) && data.projects.length > 0;
+}
+function parseSyncData(content) {
+  const data = JSON.parse(content);
+  if (!isSyncData(data)) throw new Error('Le fichier partagé ne contient pas de roadmap valide.');
+  return data;
+}
+function withLocalSettings(data) {
+  const localSettings = readJSON(dataFile())?.settings || {};
+  const settings = { ...(data.settings || {}) };
+  LOCAL_SETTINGS.forEach(key => {
+    if (typeof localSettings[key] === 'boolean') settings[key] = localSettings[key];
+  });
+  return { ...data, settings };
+}
+function sharedData(data) {
+  const copy = JSON.parse(JSON.stringify(data));
+  LOCAL_SETTINGS.forEach(key => { delete copy.settings?.[key]; });
+  return copy;
+}
+function updateSyncStatus(message) {
+  syncStatusMessage = message;
+  if (win && !win.isDestroyed()) win.webContents.send('sync:status', { folder: syncFolder, message });
+}
+function reportSyncError(err) {
+  const message = `Erreur de synchronisation : ${err.message}`;
+  if (message !== lastSyncError) console.error(message);
+  lastSyncError = message;
+  updateSyncStatus(message);
+}
+function saveSharedData(data) {
+  const file = syncDataFile();
+  if (!file) return;
+  try {
+    writeJSON(file, sharedData(data));
+    lastSyncContent = fs.readFileSync(file, 'utf8');
+    lastSyncError = null;
+    updateSyncStatus('Synchronisé');
+  } catch (err) {
+    reportSyncError(err);
+  }
+}
+function checkSharedFile() {
+  const file = syncDataFile();
+  if (!file || !fs.existsSync(file)) return;
+  try {
+    const content = fs.readFileSync(file, 'utf8');
+    if (content === lastSyncContent) return;
+    const data = withLocalSettings(parseSyncData(content));
+    writeJSON(dataFile(), data);
+    lastSyncContent = content;
+    lastSyncError = null;
+    updateSyncStatus('Mise à jour reçue');
+    if (win && !win.isDestroyed()) win.webContents.send('data:remoteUpdate', data);
+  } catch (err) {
+    reportSyncError(err);
+  }
+}
+function startSyncPolling() {
+  clearInterval(syncPoller);
+  syncPoller = setInterval(checkSharedFile, 2000);
+}
+function loadSyncConfiguration() {
+  if (!fs.existsSync(syncConfigFile())) return;
+  try {
+    const config = JSON.parse(fs.readFileSync(syncConfigFile(), 'utf8'));
+    if (typeof config.folder !== 'string' || !config.folder) return;
+    syncFolder = config.folder;
+    const file = syncDataFile();
+    if (fs.existsSync(file)) {
+      const content = fs.readFileSync(file, 'utf8');
+      const data = withLocalSettings(parseSyncData(content));
+      writeJSON(dataFile(), data);
+      lastSyncContent = content;
+      syncStatusMessage = 'Synchronisé';
+    } else {
+      syncStatusMessage = 'Dossier partagé indisponible ou fichier en attente';
+    }
+  } catch (err) {
+    reportSyncError(err);
+  }
 }
 
 /* ---------- Démarrage avec Windows (raccourci dans le dossier Démarrage) ---------- */
@@ -190,15 +284,67 @@ function applySettings(s) {
 }
 
 /* ---------- IPC ---------- */
-ipcMain.handle('data:load', () => ({ data: readJSON(dataFile()), autostart: isAutostart() }));
-ipcMain.handle('data:save', (e, data) => { writeJSON(dataFile(), data); return true; });
+ipcMain.handle('data:load', () => ({
+  data: readJSON(dataFile()),
+  autostart: isAutostart(),
+  syncFolder,
+  syncStatusMessage,
+}));
+ipcMain.handle('data:save', (e, data) => {
+  writeJSON(dataFile(), data);
+  saveSharedData(data);
+  return true;
+});
 ipcMain.on('data:saveSync', (e, data) => {
-  try { writeJSON(dataFile(), data); } catch (err) { console.error(err); }
+  try {
+    writeJSON(dataFile(), data);
+    saveSharedData(data);
+  } catch (err) { console.error(err); }
   e.returnValue = true;
 });
 ipcMain.on('settings:apply', (e, s) => applySettings(s));
 ipcMain.on('win:hide', () => win && win.hide());
 ipcMain.on('app:quit', () => { quitting = true; app.quit(); });
+
+ipcMain.handle('sync:selectFolder', async (e, data) => {
+  const result = await dialog.showOpenDialog(win, {
+    title: 'Choisir le dossier Dropbox ou Google Drive partagé entre tes PC',
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+
+  const folder = path.resolve(result.filePaths[0]);
+  const file = path.join(folder, 'roadmap-widget-sync.json');
+  let remoteData = null;
+  let content = null;
+  if (fs.existsSync(file)) {
+    content = fs.readFileSync(file, 'utf8');
+    remoteData = withLocalSettings(parseSyncData(content));
+    writeJSON(dataFile(), remoteData);
+  } else {
+    if (!isSyncData(data)) throw new Error('Aucune roadmap à enregistrer dans le dossier partagé.');
+    writeJSON(file, data);
+    content = fs.readFileSync(file, 'utf8');
+  }
+
+  writeJSON(syncConfigFile(), { folder });
+  syncFolder = folder;
+  lastSyncContent = content;
+  lastSyncError = null;
+  updateSyncStatus('Synchronisé');
+  startSyncPolling();
+  return { folder, data: remoteData, message: syncStatusMessage };
+});
+ipcMain.handle('sync:disable', () => {
+  writeJSON(syncConfigFile(), { folder: null });
+  clearInterval(syncPoller);
+  syncPoller = null;
+  syncFolder = null;
+  lastSyncContent = null;
+  lastSyncError = null;
+  updateSyncStatus('Synchronisation désactivée');
+  return true;
+});
 
 ipcMain.handle('data:export', async (e, data) => {
   const r = await dialog.showSaveDialog(win, {
@@ -232,8 +378,10 @@ if (!CAPTURE && !app.requestSingleInstanceLock()) {
     if (fs.existsSync(dataFile())) {
       try { fs.copyFileSync(dataFile(), path.join(app.getPath('userData'), 'roadmaps.backup.json')); } catch {}
     }
+    loadSyncConfiguration();
     createWindow();
     if (!CAPTURE) createTray();
+    if (syncFolder) startSyncPolling();
   });
   // Avant de quitter, on demande à l'interface d'enregistrer ses dernières modifications
   let flushed = false;

@@ -11,6 +11,8 @@ const bridge = window.api || {
   saveSync(d) { localStorage.setItem('roadmaps', JSON.stringify(d)); },
   applySettings() {},
   setZoom(f) { document.body.style.zoom = f; },
+  async selectSyncFolder() { return null; },
+  async disableSync() { return false; },
   async exportData(d) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' }));
@@ -22,6 +24,8 @@ const bridge = window.api || {
   hide() {},
   quit() {},
   onSettingsPatch() {},
+  onRemoteData() {},
+  onSyncStatus() {},
 };
 
 /* =========================================================
@@ -203,6 +207,9 @@ let pendingRender = false;
 let lastLayout = null;
 let saveTimer = null;
 let savePending = false;
+let syncFolder = null;
+let syncStatusMessage = 'Synchronisation non configurée';
+let lastNotifiedSyncError = null;
 const justCompleted = new Set();
 const layers = [];           // fonctions de fermeture des popovers / modales (Échap)
 
@@ -859,13 +866,54 @@ function settingsHTML() {
     ${row('Toujours au premier plan', tog('alwaysOnTop'))}
     ${row('Afficher dans la barre des tâches', tog('showInTaskbar'), 'Sinon : icône dans la zone de notification')}
     ${row('Lancer au démarrage de Windows', tog('autostart'))}
+    <div class="sec">Synchronisation entre PC</div>
+    <p class="sync-info">${esc(syncFolder ? `${syncStatusMessage}\n${syncFolder}` : syncStatusMessage)}</p>
+    <div class="btn-row">
+      <button class="btn" data-do="sync-select">${syncFolder ? 'Changer de dossier' : 'Choisir un dossier partagé'}</button>
+      ${syncFolder ? '<button class="btn" data-do="sync-disable">Désactiver</button>' : ''}
+    </div>
     <div class="sec">Données</div>
     <div class="btn-row">
       <button class="btn" data-do="export">${ico('download')} Exporter</button>
       <button class="btn" data-do="import">${ico('upload')} Importer</button>
       <button class="btn danger-ghost" data-do="quit">${ico('power')} Quitter le widget</button>
     </div>
-    <p class="hint">Double-clic sur une tâche pour la modifier · glisser-déposer pour la déplacer<br>Ctrl+Z annuler · Ctrl+Y rétablir · clic sur un numéro pour replier l'étape</p>`;
+    <p class="hint">Choisis le dossier Dropbox ou Google Drive synchronisé sur tes deux PC. Projets, tâches et apparence seront partagés ; position de fenêtre et démarrage resteront propres à chaque PC. Évite de modifier les deux PC en même temps.<br>Double-clic sur une tâche pour la modifier · glisser-déposer pour la déplacer<br>Ctrl+Z annuler · Ctrl+Y rétablir · clic sur un numéro pour replier l'étape</p>`;
+}
+
+async function selectSyncFolder() {
+  try {
+    const result = await bridge.selectSyncFolder(state);
+    if (!result) return;
+    syncFolder = result.folder;
+    syncStatusMessage = result.message;
+    if (result.data) {
+      const incoming = normalize(result.data);
+      if (!incoming) throw new Error('Le fichier partagé ne contient pas de roadmap valide.');
+      state = incoming;
+      history = [];
+      future = [];
+      editing = null;
+      applySettings();
+      render();
+    }
+    toast('Synchronisation activée');
+  } catch (err) {
+    syncStatusMessage = `Erreur de synchronisation : ${err.message}`;
+    toast(syncStatusMessage);
+  }
+}
+
+async function disableSync() {
+  try {
+    await bridge.disableSync();
+    syncFolder = null;
+    syncStatusMessage = 'Synchronisation désactivée';
+    toast(syncStatusMessage);
+  } catch (err) {
+    syncStatusMessage = `Erreur de synchronisation : ${err.message}`;
+    toast(syncStatusMessage);
+  }
 }
 
 function openSettings() {
@@ -875,6 +923,10 @@ function openSettings() {
     const st = m.box.scrollTop;
     m.box.innerHTML = settingsHTML();
     m.box.scrollTop = st;
+    m.box.querySelector('[data-close]').addEventListener('click', e => {
+      e.preventDefault();
+      m.close();
+    });
   };
   paint();
   m.box.addEventListener('click', e => {
@@ -882,10 +934,11 @@ function openSettings() {
     if (segBtn) { setSetting(segBtn.parentElement.dataset.key, segBtn.dataset.val); paint(); return; }
     const acc = e.target.closest('[data-accent]');
     if (acc) { setSetting('accent', acc.dataset.accent); paint(); return; }
-    if (e.target.closest('[data-close]')) { m.close(); return; }
     const d = e.target.closest('[data-do]')?.dataset.do;
     if (d === 'export') exportData();
     else if (d === 'import') { m.close(); importData(); }
+    else if (d === 'sync-select') selectSyncFolder().then(paint);
+    else if (d === 'sync-disable') disableSync().then(paint);
     else if (d === 'quit') { flushSave(true); bridge.quit(); }
   });
   m.box.addEventListener('input', e => {
@@ -1081,6 +1134,35 @@ bridge.onSettingsPatch(patch => {
   scheduleSave();
   render();
 });
+bridge.onRemoteData(data => {
+  const incoming = normalize(data);
+  if (!incoming) {
+    syncStatusMessage = 'Erreur : la mise à jour reçue ne contient pas de roadmap valide.';
+    toast(syncStatusMessage);
+    return;
+  }
+  clearTimeout(saveTimer);
+  savePending = false;
+  state = incoming;
+  history = [];
+  future = [];
+  editing = null;
+  applySettings();
+  render();
+  toast('Roadmaps mises à jour depuis le dossier partagé');
+});
+bridge.onSyncStatus(status => {
+  syncFolder = status.folder;
+  syncStatusMessage = status.message;
+  if (syncStatusMessage.startsWith('Erreur de synchronisation :')) {
+    if (syncStatusMessage !== lastNotifiedSyncError) toast(syncStatusMessage);
+    lastNotifiedSyncError = syncStatusMessage;
+  } else {
+    lastNotifiedSyncError = null;
+  }
+  const info = $('.sync-info');
+  if (info) info.textContent = syncFolder ? `${syncStatusMessage}\n${syncFolder}` : syncStatusMessage;
+});
 
 /* =========================================================
    Démarrage
@@ -1089,9 +1171,15 @@ async function init() {
   document.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = ico(el.dataset.icon); });
   const res = await bridge.load();
   state = normalize(res?.data) || seed();
+  syncFolder = res?.syncFolder || null;
+  syncStatusMessage = res?.syncStatusMessage || 'Synchronisation non configurée';
   if (typeof res?.autostart === 'boolean') state.settings.autostart = res.autostart;
   applySettings();
   render();
   scheduleSave();
+  if (syncStatusMessage.startsWith('Erreur de synchronisation :')) {
+    lastNotifiedSyncError = syncStatusMessage;
+    toast(syncStatusMessage);
+  }
 }
 init();
